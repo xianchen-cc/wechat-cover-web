@@ -6296,6 +6296,14 @@ window.toggleSidebar=function(){
                     <input type="file" id="side-upload-ref" accept="image/*" multiple style="display:none;" onchange="handleSideRefUpload(event)">
                 </label>
 
+                <details id="side-api-config" style="margin-top:12px;padding:10px;background:#13132b;border:1px solid #252540;border-radius:8px;">
+                    <summary style="cursor:pointer;color:#989fb0;font-size:12px;font-weight:600;">临时 API 连接设置</summary>
+                    <div style="font-size:10px;color:#676d87;line-height:1.5;margin:7px 0;">仅保存在当前浏览器标签页，与独立 AI 生图工作台共用。</div>
+                    <input id="side-api-base" type="url" placeholder="API 地址，例如 https://example.com/v1" autocomplete="off" style="width:100%;margin-bottom:7px;background:#1a1a30;border:1px solid #303052;border-radius:7px;color:#c8cce0;padding:8px 9px;font-size:11px;">
+                    <input id="side-api-key" type="password" placeholder="API 密钥" autocomplete="off" style="width:100%;margin-bottom:7px;background:#1a1a30;border:1px solid #303052;border-radius:7px;color:#c8cce0;padding:8px 9px;font-size:11px;">
+                    <input id="side-api-model" type="text" value="gpt-image-2" placeholder="模型" autocomplete="off" style="width:100%;background:#1a1a30;border:1px solid #303052;border-radius:7px;color:#c8cce0;padding:8px 9px;font-size:11px;">
+                </details>
+
                 <button class="btn-generate-ai" id="side-btn-gen" onclick="sidebarGenerate()" 
                     style="width:100%;margin-top:14px;padding:11px;background:linear-gradient(135deg,#6C8FFF,#4A6CF7);border:none;
                     border-radius:10px;color:#fff;font-size:13px;font-weight:600;cursor:pointer;font-family:'Noto Sans SC',sans-serif;">
@@ -6863,15 +6871,28 @@ window.toggleSidebar=function(){
     }
     async function normalizeImage(src) {
         if (src.indexOf('data:') === 0) return src;
-        return asDataUrl('/api/proxy-image?url=' + encodeURIComponent(src));
+        return asDataUrl(src);
     }
     async function removeBackground(src) {
-        try {
-            var response = await fetch('/api/remove-background', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: src }) });
-            var result = await response.json();
-            if (response.ok && result.image) return result.image;
-        } catch (_) {}
-        return src;
+        return await new Promise(function (resolve) {
+            var img = new Image();
+            img.crossOrigin = 'anonymous';
+            img.onload = function () {
+                try {
+                    var canvas = document.createElement('canvas');
+                    canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+                    var ctx = canvas.getContext('2d'); ctx.drawImage(img, 0, 0);
+                    var imageData = ctx.getImageData(0, 0, canvas.width, canvas.height), data = imageData.data;
+                    for (var i = 0; i < data.length; i += 4) {
+                        var r = data[i], g = data[i + 1], b = data[i + 2], strength = g - Math.max(r, b);
+                        if (g > 100 && strength > 45) data[i + 3] = strength >= 105 ? 0 : Math.floor(data[i + 3] * Math.max(0, (105 - strength) / 60));
+                    }
+                    ctx.putImageData(imageData, 0, 0); resolve(canvas.toDataURL('image/png'));
+                } catch (_) { resolve(src); }
+            };
+            img.onerror = function () { resolve(src); };
+            img.src = src;
+        });
     }
     window.handleSideRefUpload = function (event) {
         Array.from(event.target.files || []).filter(function (file) { return file.type.indexOf('image/') === 0; }).forEach(function (file) {
@@ -6889,15 +6910,24 @@ window.toggleSidebar=function(){
         var subjects = document.getElementById('side-subjects').value.trim();
         var style = document.getElementById('side-ai-style').value.trim();
         var negative = document.getElementById('side-ai-negative').value.trim();
+        var apiBase = document.getElementById('side-api-base').value.trim().replace(/\/+$/, '');
+        var apiKey = document.getElementById('side-api-key').value.trim();
+        var apiModel = document.getElementById('side-api-model').value.trim();
         if (!scene || !subjects) { alert('请填写【】中的场景和主体物'); return; }
         if (!style) { alert('请选择一种风格提示词'); return; }
+        if (!apiBase || !apiKey || !apiModel) {
+            document.getElementById('side-api-config').open = true;
+            alert('请先填写 API 地址、API 密钥和模型'); return;
+        }
+        try { new URL(apiBase); } catch (_) { alert('API 地址格式不正确'); return; }
+        sessionStorage.setItem('cover-tool-api-config', JSON.stringify({base:apiBase,key:apiKey,model:apiModel}));
         var prompt = '请为我生成在【' + scene + '】场景下的配图，主体物为【' + subjects + '】。';
         var finalPrompt = prompt + '\n\n风格提示词：' + style + (negative ? '\n\n反向提示词：配图中不要出现【' + negative + '】。' : '');
         btn.disabled = true; btn.textContent = '正在生成并抠图...'; status.style.display = 'flex'; statusText.textContent = '正在结合提示词和参考图生成...';
         try {
             var refs = await Promise.all(Array.from(selectedReferences).map(asDataUrl));
-            var response = await fetch('/api/gpt-image', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ model: 'gpt-image-2', prompt: finalPrompt, n: 1, size: '1024x1024', reference_images: refs }) });
+            var response = await fetch(apiBase + '/images/generations', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+                body: JSON.stringify({ model: apiModel, prompt: finalPrompt, n: 1, size: '1024x1024', reference_images: refs }) });
             var data = await readImageApiResponse(response);
             if (!response.ok || data.error) throw new Error((data.error && data.error.message) || '生图服务返回异常');
             var row = (data.data || [])[0] || {};
@@ -7252,12 +7282,17 @@ window.toggleSidebar=function(){
 })();
 </script>
 <script>
-/* 网页测试版统一入口：所有旧的内嵌生图按钮都进入临时 API 配置工作台。 */
+/* 网页测试版入口：独立 AI 功能进入工作台，侧边栏保留原位生成交互。 */
 (function () {
     function openWebImageStudio() { window.location.href = 'ai.html'; }
     window.generateAIImage = openWebImageStudio;
     window.jimengGenerate = openWebImageStudio;
-    window.sidebarGenerate = openWebImageStudio;
+    try {
+        var saved = JSON.parse(sessionStorage.getItem('cover-tool-api-config') || '{}');
+        if (saved.base) document.getElementById('side-api-base').value = saved.base;
+        if (saved.key) document.getElementById('side-api-key').value = saved.key;
+        if (saved.model) document.getElementById('side-api-model').value = saved.model;
+    } catch (_) {}
 })();
 </script>
 </body>
